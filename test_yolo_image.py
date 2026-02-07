@@ -1,89 +1,110 @@
-import cv2
-import numpy as np
-import onnxruntime as ort
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
 import os
+import numpy as np
+from PIL import Image
+import time
 
 # --- CẤU HÌNH ---
-# Ông nhớ đổi đường dẫn trỏ đúng vào file .onnx nhé
-ONNX_PATH  = r"Convert-Zero-DCE++\zerodce.onnx" 
-IMAGE_PATH = "test_image.jpg"
+IMAGE_PATH = "test_image.jpg"  # <-- Điền tên ảnh của ông vào đây
+MODEL_PATH = "Zero-DCE_extension-main/Zero-DCE++/snapshots_Zero_DCE++/Epoch99.pth" # <-- Đường dẫn file weights
 
-print("\n--- ZERO-DCE++ ONNX RUNTIME TEST ---")
+# ==========================================
+# 1. ĐỊNH NGHĨA MODEL (PHẢI ĐỂ Ở ĐÂY ĐỂ FIX LỖI 3 KÊNH)
+# (Nếu import model.py gốc sẽ bị lỗi size mismatch 24 vs 3)
+# ==========================================
+class C_DCE_Sep_Conv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(C_DCE_Sep_Conv, self).__init__()
+        self.depth_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels, bias=True)
+        self.point_conv = nn.Conv2d(in_channels, out_channels, 1, 1, 0, groups=1, bias=True)
 
-# 1. Kiểm tra file
-if not os.path.exists(ONNX_PATH):
-    print(f"❌ LỖI: Không tìm thấy file model tại: {ONNX_PATH}")
-    print("👉 Hãy chắc chắn ông đã có file .onnx (nếu chưa có thì export từ .pth sang)")
-    exit()
+    def forward(self, x):
+        out = self.depth_conv(x)
+        out = self.point_conv(out)
+        return out
 
-# 2. Load Model ONNX
-# Tự động chọn GPU (CUDA) nếu có, không thì chạy CPU
-providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-try:
-    session = ort.InferenceSession(ONNX_PATH, providers=providers)
-except Exception as e:
-    print(f"⚠️ Lỗi khởi tạo (có thể do chưa cài CUDA), chuyển sang CPU...")
-    session = ort.InferenceSession(ONNX_PATH, providers=['CPUExecutionProvider'])
+class enhance_net_nopool(nn.Module):
+    def __init__(self, scale_factor=1):
+        super(enhance_net_nopool, self).__init__()
+        self.relu = nn.ReLU(inplace=True)
+        number_f = 32
+        self.e_conv1 = C_DCE_Sep_Conv(3, number_f)
+        self.e_conv2 = C_DCE_Sep_Conv(number_f, number_f)
+        self.e_conv3 = C_DCE_Sep_Conv(number_f, number_f)
+        self.e_conv4 = C_DCE_Sep_Conv(number_f, number_f)
+        self.e_conv5 = C_DCE_Sep_Conv(number_f * 2, number_f)
+        self.e_conv6 = C_DCE_Sep_Conv(number_f * 2, number_f)
+        # QUAN TRỌNG: Output = 3 (RGB) để khớp file Epoch99.pth của ông
+        self.e_conv7 = C_DCE_Sep_Conv(number_f * 2, 3) 
 
-# Lấy tên Input/Output tự động (Khỏi lo sai tên layer)
-input_name = session.get_inputs()[0].name
-output_name = session.get_outputs()[0].name
-print(f"✅ Model Loaded! Input: '{input_name}' -> Output: '{output_name}'")
+    def forward(self, x):
+        x1 = self.relu(self.e_conv1(x))
+        x2 = self.relu(self.e_conv2(x1))
+        x3 = self.relu(self.e_conv3(x2))
+        x4 = self.relu(self.e_conv4(x3))
+        x5 = self.relu(self.e_conv5(torch.cat([x3, x4], 1)))
+        x6 = self.relu(self.e_conv6(torch.cat([x2, x5], 1)))
+        # Output ảnh trực tiếp
+        x_r = F.tanh(self.e_conv7(torch.cat([x1, x6], 1)))
+        return x_r
 
-# 3. Đọc ảnh
-img = cv2.imread(IMAGE_PATH)
-if img is None:
-    print("❌ LỖI: Không tìm thấy ảnh input!")
-    exit()
+# ==========================================
+# 2. CODE LOGIC GỐC CỦA ÔNG (Đã sửa thành 1 ảnh)
+# ==========================================
+def lowlight(image_path):
+    # Tự động nhận diện thiết bị (để tránh lỗi nếu máy ko có GPU)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"⚙️ Đang chạy trên: {device}")
+    
+    scale_factor = 12
+    
+    # --- Pre-processing (Giữ nguyên logic gốc) ---
+    data_lowlight = Image.open(image_path).convert('RGB') # Fix: convert RGB tránh lỗi ảnh PNG 4 kênh
+    data_lowlight = (np.asarray(data_lowlight)/255.0)
+    data_lowlight = torch.from_numpy(data_lowlight).float()
 
-h_orig, w_orig = img.shape[:2]
+    h=(data_lowlight.shape[0]//scale_factor)*scale_factor
+    w=(data_lowlight.shape[1]//scale_factor)*scale_factor
+    data_lowlight = data_lowlight[0:h,0:w,:]
+    data_lowlight = data_lowlight.permute(2,0,1)
+    
+    # Đẩy vào device (GPU/CPU)
+    data_lowlight = data_lowlight.to(device).unsqueeze(0)
 
-# 4. Chuẩn bị Input (Pre-processing)
-# Resize về 320x320 (Kích thước chuẩn của Zero-DCE)
-target_w, target_h = 320, 320
-img_resized = cv2.resize(img, (target_w, target_h))
+    # --- Load Model ---
+    # Thay vì import model, ta dùng class định nghĩa ở trên
+    DCE_net = enhance_net_nopool(scale_factor).to(device)
+    
+    print(f"⏳ Đang load weights từ {MODEL_PATH}...")
+    checkpoint = torch.load(MODEL_PATH, map_location=device)
+    
+    # Fix lỗi key 'module.'
+    new_state_dict = {}
+    for k, v in checkpoint.items():
+        name = k.replace('module.', '')
+        new_state_dict[name] = v
+        
+    DCE_net.load_state_dict(new_state_dict, strict=True)
+    DCE_net.eval()
 
-# Đổi BGR -> RGB
-img_in = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    # --- Inference ---
+    start = time.time()
+    # Logic gốc trả về 2 biến, nhưng model của ông chỉ trả về 1 ảnh (vì là bản 3 kênh)
+    enhanced_image = DCE_net(data_lowlight) 
+    end_time = (time.time() - start)
+    print(f"⏱️ Xử lý xong trong: {end_time:.4f} giây")
 
-# Normalize: Chia 255 để về khoảng [0, 1]
-img_in = img_in.astype(np.float32) / 255.0
+    # --- Save Image ---
+    result_path = "result_" + os.path.basename(image_path)
+    torchvision.utils.save_image(enhanced_image, result_path)
+    print(f"🎉 Đã lưu ảnh tại: {result_path}")
 
-# Transpose: Đổi trục từ (H, W, C) -> (C, H, W) 
-# (Đây là bước NCNN tự làm, nhưng ONNX phải làm thủ công)
-img_in = img_in.transpose(2, 0, 1)
-
-# Thêm dimension Batch: (3, 320, 320) -> (1, 3, 320, 320)
-img_in = np.expand_dims(img_in, axis=0)
-
-# 5. Chạy Model (Inference)
-# Trả về list kết quả, lấy phần tử đầu tiên [0]
-outputs = session.run([output_name], {input_name: img_in})
-output_tensor = outputs[0]
-
-# 6. Xử lý Output (Post-processing)
-# Bỏ dimension Batch: (1, 3, 320, 320) -> (3, 320, 320)
-result = np.squeeze(output_tensor)
-
-# Đổi trục ngược lại: (C, H, W) -> (H, W, C) để hiển thị
-result = result.transpose(1, 2, 0)
-
-# Nhân 255 và clip giá trị để không bị lỗi màu
-result = (result * 255.0).clip(0, 255).astype(np.uint8)
-
-# Đổi RGB -> BGR
-result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-
-# Resize về kích thước gốc
-result_final = cv2.resize(result_bgr, (w_orig, h_orig))
-
-# 7. Hiển thị
-cv2.putText(img, "ORIGINAL", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-cv2.putText(result_final, "ONNX ENHANCED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-combined = np.hstack((img, result_final))
-cv2.imshow("Zero-DCE ONNX Result", combined)
-
-print("👉 Đã hiện ảnh. Bấm phím bất kỳ để thoát.")
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+    if os.path.exists(IMAGE_PATH):
+        with torch.no_grad():
+            lowlight(IMAGE_PATH)
+    else:
+        print(f"❌ Không tìm thấy file ảnh: {IMAGE_PATH}")
